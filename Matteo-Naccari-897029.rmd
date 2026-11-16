@@ -1,0 +1,416 @@
+---
+title: "Social Network Project"
+author: "Matteo Naccari"
+date: "a.y 2026-2027"
+output:
+  html_document: null
+  toc: true
+  df_print: paged
+  pdf_document: default
+---
+
+```{r}
+library(datavolley)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(knitr)
+library(patchwork)
+library(ggrepel)
+```
+
+# Research question 
+
+"Social Network Analysis in Elite Volleyball: Quantifying Tactical Predictability and Ball Distribution Adaptability via Network Metrics"
+
+## 1. Data cleaning and counting pass connection
+
+```{r}
+match_data <- dv_read("new_test.dvw")
+plays <- match_data$plays
+
+transitions_base <- plays %>%
+  filter(!is.na(player_name), !is.na(skill)) %>%
+  # group by individual point to keep sequence analysis within the same rally
+  group_by(match_id, set_number, point_id) %>%
+  # identify the next touch: player, team, and skill
+  mutate(
+    next_player    = lead(player_name),
+    next_team      = lead(team),
+    next_skill     = lead(skill),
+    reception_eval = lag(evaluation)
+  ) %>%
+  ungroup()
+
+network_data <- transitions_base %>%
+  # keep only valid teammate connections (from Reception/Dig to Set or from Set to Attack)
+  filter(
+    team == next_team,
+    player_name != next_player,
+    (skill %in% c("Reception", "Dig") & next_skill == "Set") |
+    (skill == "Set" & next_skill == "Attack")
+  ) %>%
+  count(team, from = player_name, to = next_player, name = "weight")
+```
+
+## 2. The Network
+We model team dynamics as a directed weighted graph $G = (V, E)$, where nodes are players and directed edges $(i,j)$ represent consecutive touches between teammates, weighted by touch frequency $w_{ij}$.
+
+```{r}
+draw_match_network <- function(data, team_name, team_color, main_title = "Match Network", sub_title = NULL) {
+  # filter data for the single team and keep last names only
+  team_edges <- data %>% 
+    filter(team == team_name) %>% 
+    mutate(
+      from = word(from, -1),
+      to = word(to, -1)
+    ) %>% 
+    select(from, to, weight)
+  
+  # create graph object
+  g <- graph_from_data_frame(team_edges, directed = TRUE)
+  
+  # draw network plot
+  ggraph(g, layout = "circle") +
+    geom_edge_arc(
+      aes(width = weight, label = weight),
+      strength = 0.15, color = team_color, alpha = 0.6,
+      arrow = arrow(length = unit(2.5, "mm"), type = "closed"),
+      end_cap = circle(5, "mm"),
+      label_size = 3.2
+    ) +
+    scale_edge_width(range = c(0.5, 2.5), guide = "none") +
+    geom_node_point(size = 6, fill = "white", color = team_color, shape = 21, stroke = 1.3) +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold", size = 3.5) +
+    theme_graph() +
+    labs(
+      title = paste(main_title, ":", team_name),
+      subtitle = sub_title
+    )
+}
+
+teams <- unique(network_data$team)
+
+draw_match_network(network_data, teams[1], "blue")
+draw_match_network(network_data, teams[2], "red")
+```
+
+## 3. Hub centrality
+By evaluating incoming (in-degree) and outgoing (out-degree) flow metrics, we quantify how ball distribution is allocated across team members. This analysis validates the setter’s structural role as the primary network hub while identifying key offensive targets (high in-degree) and play-building anchors (high out-degree).
+
+```{r}
+calculate_hub_centrality <- function(net_df, team_name) {
+  df_team <- net_df %>% filter(team == team_name)
+  
+  # incoming flows to the player
+  in_edges <- df_team %>% 
+    mutate(to = word(to, -1)) %>% 
+    count(player_name = to, wt = weight, name = "in_degree")
+  
+  # outgoing flows from the player
+  out_edges <- df_team %>% 
+    mutate(from = word(from, -1)) %>% 
+    count(player_name = from, wt = weight, name = "out_degree")
+
+  # merge incoming/outgoing degrees and compute total flow percentage
+  full_join(in_edges, out_edges, by = "player_name") %>%
+    mutate(
+      in_degree  = coalesce(in_degree, 0L),
+      out_degree = coalesce(out_degree, 0L),
+      total_degree = in_degree + out_degree,
+      total_flow_pct = round((total_degree / sum(total_degree)) * 100, 1)
+    ) %>%
+    arrange(desc(total_degree))
+}
+
+(hub_team_A <- calculate_hub_centrality(network_data, teams[1]))
+(hub_team_B <- calculate_hub_centrality(network_data, teams[2]))
+```
+
+## 4. Eigenvector Centrality
+
+While degree centrality counts individual connections, **Eigenvector Centrality** quantifies a node's influence by taking into account the centrality of its neighbors. In a directed sports network $G = (V, E)$, the eigenvector centrality $x_i$ of player $i$ is proportional to the sum of the centralities of all players connected to them:
+
+$$\lambda x_i = \sum_{j=1}^{n} A_{ij} x_j$$
+
+where $A_{ij}$ represents the weighted adjacency matrix (touch volume) and $\lambda$ is the largest eigenvalue of $A$. High values identify key players operating within the primary hub-and-spoke sequence of the team's build-up play.
+
+```{r}
+calculate_eigenvector_centrality <- function(net_df, team_name) {
+  team_edges <- net_df %>% 
+    filter(team == team_name) %>% 
+    mutate(
+      from = word(from, -1),
+      to = word(to, -1)
+    ) %>% 
+    select(from, to, weight)
+  
+  g <- graph_from_data_frame(team_edges, directed = TRUE)
+  
+  ev_scores <- eigen_centrality(g, weights = E(g)$weight, directed = TRUE)$vector
+
+  data.frame(
+    player_name = names(ev_scores),
+    eigen_centrality = round(ev_scores, 4),
+    team = team_name,
+    row.names = NULL 
+  ) %>%
+    arrange(desc(eigen_centrality))
+}
+
+(ev_team_A <- calculate_eigenvector_centrality(network_data, teams[1]))
+(ev_team_B <- calculate_eigenvector_centrality(network_data, teams[2]))
+```
+
+
+## 5. Attacker Workload Distribution
+Isolates setter-to-attacker transitions (Set -> Attack) to quantify the outgoing flow from the setter,
+measuring the exact offensive workload and distribution strategy across key hitters.
+
+```{r}
+set_attacks <- transitions_base %>%
+  filter(team == next_team, skill == "Set", next_skill == "Attack") %>%
+  mutate(
+    setter       = word(player_name, -1),
+    attacker     = word(next_player, -1),
+    team_score   = if_else(team == home_team, home_team_score, visiting_team_score),
+    opp_score    = if_else(team == home_team, visiting_team_score, home_team_score),
+    score_margin = team_score - opp_score,
+    game_phase   = if_else(score_margin <= -3, "Trailing", "Normal_Leading"),
+    pass_quality = if_else(
+      reception_eval %in% c("Perfect pass", "Positive, attack", "Positive pass", "#", "+"), 
+      "Perfect", 
+      "Non_Perfect"
+    )
+  )
+
+# isolate setter -> attacker transitions
+attacker_workload <- set_attacks %>%
+  count(team, attacker, name = "sets_received") %>%
+  group_by(team) %>%
+  mutate(pct = round((sets_received / sum(sets_received)) * 100, 1)) %>%
+  ungroup()
+
+ggplot(attacker_workload, aes(x = pct, y = reorder(attacker, pct), fill = team)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(pct, "%")), 
+    hjust = -0.15,          
+    fontface = "bold", 
+    size = 3.5
+  ) +
+  facet_wrap(~team, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 45)) + 
+  theme_minimal() +
+  labs(
+    title = "Attacker Workload Distribution (Out-Degree)",
+    x = "Percentage of Sets (%)", 
+    y = "Attacker"
+  )
+```
+
+```{r}
+# sub-network
+
+attacks <- set_attacks %>%
+  count(team, from = setter, to = attacker, name = "weight")
+
+teams <- unique(attacks$team)
+
+draw_match_network(attacks, teams[1], "blue", main_title = "Distribution Network", sub_title = "Pass volume: Setter -> Attackers")
+draw_match_network(attacks, teams[2], "red", main_title = "Distribution Network", sub_title = "Pass volume: Setter -> Attackers")
+```
+
+## 6. Workload vs. Attack Efficiency Analysis
+To evaluate the tactical efficacy of setter distribution strategies, we cross-referenced each attacker's workload percentage ($\text{Set Share %}$) with their scoring efficiency ($\text{Kill%}$). This dual-metric approach reveals whether high-volume targets justified their workload or suffered from predictable blocking and fatigue.
+
+```{r}
+workload_summary <- attacks %>%
+  group_by(team, attacker = to) %>%
+  summarise(sets_received = sum(weight), .groups = "drop") %>%
+  group_by(team) %>%
+  mutate(pct = round((sets_received / sum(sets_received)) * 100, 1)) %>%
+  ungroup()
+
+# attack efficiency calculation (Kill %) 
+attack_summary <- plays %>%
+  filter(skill == "Attack", !is.na(player_name)) %>%
+  mutate(player_name = word(player_name, -1)) %>%
+  group_by(team, player_name) %>%
+  summarise(
+    total_attacks = n(),
+    kills = sum(evaluation == "Winning attack", na.rm = TRUE),
+    kill_pct = round((kills / total_attacks) * 100, 1),
+    .groups = "drop"
+  )
+
+# merge
+data_plot_clean <- workload_summary %>%
+  inner_join(attack_summary, by = c("team", "attacker" = "player_name")) %>%
+  mutate(
+    # extracts last name only to fit labels cleanly
+    label_name = word(attacker, -1)
+  )
+
+ggplot(data_plot_clean, aes(x = pct, y = kill_pct, color = team)) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    aes(label = label_name),
+    fontface = "bold",
+    size = 3.8,
+    box.padding = 0.6,
+    point.padding = 0.3,
+    force = 4,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    segment.color = "grey60",
+    segment.size = 0.4
+  ) +
+  facet_wrap(~team) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Workload (%) vs Attack Efficiency (Kill %)",
+    x = "Share of Sets Received (%) [Workload]",
+    y = "Attack Success Rate (%) [Kill %]"
+  )
+```
+
+## 7. Shannon Entropy
+
+To quantify the tactical predictability of setter decision-making under match stress, we implemented a metric based on **Relative Shannon Entropy** ($H_{rel}$). Entropy measures the degree of randomness or diversity in ball distribution across available attackers:
+
+$$H_{rel} = \frac{-\sum_{i=1}^{k} p_i \log_2(p_i)}{\log_2(k)}$$
+
+where $p_i$ represents the proportion of sets received by attacker $i$, and $k$ is the total number of active attack options. 
+
+- $H_{rel} = 1$ indicates maximum unpredictability (an perfectly even distribution across all options).
+- $H_{rel} \to 0$ indicates high predictability (over-reliance on a single primary target).
+
+By comparing $H_{rel}$ during standard play (`Normal_Leading`) versus high-stress scenarios (`Trailing`), we evaluate whether score-induced pressure causes setters to narrow their distribution patterns and rely on predictable fallback targets ($\Delta H = H_{\text{Trailing}} - H_{\text{Normal}}$).
+
+```{r}
+calculate_entropy <- function(counts) {
+  p <- counts / sum(counts)
+  p <- p[p > 0]
+  k <- length(p)
+  if (k <= 1) return(0)
+  
+  h_abs <- -sum(p * log2(p))
+  h_max <- log2(k)
+  
+  return(round(h_abs / h_max, 4))
+}
+
+main_setters <- set_attacks %>%
+  count(team, setter) %>%
+  group_by(team) %>%
+  slice_max(n, n = 1) %>%
+  pull(setter)
+
+total_entropy <- set_attacks %>%
+  filter(setter %in% main_setters) %>%
+  group_by(team, setter, game_phase, attacker) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  summarise(H_rel = calculate_entropy(n), .groups = "drop") %>%
+  pivot_wider(names_from = game_phase, values_from = H_rel) %>%
+  mutate(
+    Normal_Leading = coalesce(Normal_Leading, 0),
+    Trailing       = coalesce(Trailing, 0),
+    Delta_H        = round(Trailing - Normal_Leading, 4)
+  )
+
+print(total_entropy)
+```
+
+## 8. Frobenius Distance
+
+To assess how reception quality impacts distribution structure, we computed the **Frobenius Distance** ($D_F$) between two normalized adjacency matrices representing setter choices under **Perfect** vs. **Non-Perfect** pass conditions:
+
+$$D_F = \| A_{\text{Perfect}} - A_{\text{Non-Perfect}} \|_F = \sqrt{\sum_{i} \sum_{j} \left| a_{ij}^{(\text{Perf})} - a_{ij}^{(\text{Non-Perf})} \right|^2}$$
+
+A low Frobenius Distance ($D_F \approx 0$) indicates high structural stability, meaning the setter maintains her intended tactical distribution regardless of pass quality. Conversely, a higher $D_F$ value highlights tactical constraint, where poor reception forces the setter to abandon complex offensive patterns and rely on predictable fallback options (e.g., high balls to the high-volume outside hitter).
+
+```{r}
+calculate_frobenius <- function(df_data, team_name) {
+  df_sub <- df_data %>% filter(team == team_name)
+  
+  # matrix for perfect pass
+  m_perf <- table(df_sub$setter[df_sub$pass_quality == "Perfect"], 
+                  df_sub$attacker[df_sub$pass_quality == "Perfect"])
+  
+  # matrix for non-perfect Pass
+  m_imperf <- table(df_sub$setter[df_sub$pass_quality == "Non_Perfect"], 
+                    df_sub$attacker[df_sub$pass_quality == "Non_Perfect"])
+  
+  # matrix normalization
+  if (sum(m_perf) > 0) m_perf <- m_perf / sum(m_perf)
+  if (sum(m_imperf) > 0) m_imperf <- m_imperf / sum(m_imperf)
+  
+  all_setters   <- union(rownames(m_perf), rownames(m_imperf))
+  all_attackers <- union(colnames(m_perf), colnames(m_imperf))
+  
+  mat1 <- matrix(0, nrow = length(all_setters), ncol = length(all_attackers),
+                 dimnames = list(all_setters, all_attackers))
+  mat2 <- mat1
+  
+  mat1[rownames(m_perf), colnames(m_perf)]     <- m_perf
+  mat2[rownames(m_imperf), colnames(m_imperf)] <- m_imperf
+  
+  # frobenius distance
+  d_f <- norm(mat1 - mat2, type = "F")
+  return(round(d_f, 4))
+}
+
+teams <- unique(set_attacks$team)
+
+frobenius_res <- data.frame(
+  team = teams,
+  Frobenius_Distance = sapply(teams, function(t) calculate_frobenius(set_attacks, t))
+)
+
+print(frobenius_res)
+```
+
+```{r}
+# drew Frobenius comparison network 
+
+draw_frobenius_network <- function(df_data, team_name, pass_qual, team_color = "navy") {
+  edges <- df_data %>%
+    filter(team == team_name, pass_quality == pass_qual, setter %in% main_setters) %>%
+    group_by(setter, attacker) %>%
+    summarise(weight_raw = n(), .groups = "drop") %>%
+    mutate(weight = round((weight_raw / sum(weight_raw)) * 100, 1)) %>%
+    select(from = setter, to = attacker, weight)
+  
+  if (nrow(edges) == 0) return(NULL)
+  
+  all_nodes <- unique(c(edges$from, edges$to))
+  g <- graph_from_data_frame(edges, vertices = data.frame(name = all_nodes), directed = TRUE)
+ 
+  ggraph(g, layout = "circle") +
+    geom_edge_arc(
+      aes(width = weight, label = paste0(weight, "%")),
+      strength = 0.2, color = team_color, alpha = 0.7,
+      arrow = arrow(length = unit(3, 'mm'), type = "closed"),
+      end_cap = circle(6, 'mm'), label_size = 3.5, label_colour = "black"
+    ) +
+    scale_edge_width(range = c(0.8, 3.0), guide = "none") +
+    geom_node_point(size = 8, fill = "white", color = team_color, shape = 21, stroke = 1.5) +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold", size = 3.8, box.padding = 0.8) +
+    theme_graph() +
+    labs(
+      title = paste(team_name, "-", pass_qual, "Pass Network"),
+      subtitle = "Set distribution percentage (%)"
+    )
+}
+
+(p_milano_perf   <- draw_frobenius_network(set_attacks, teams[1], "Perfect", "blue"))
+(p_milano_imperf <- draw_frobenius_network(set_attacks, teams[1], "Non_Perfect", "red"))
+
+(p_firenze_perf   <- draw_frobenius_network(set_attacks, teams[2], "Perfect", "blue"))
+(p_firenze_imperf <- draw_frobenius_network(set_attacks, teams[2], "Non_Perfect", "red"))
+```
+
+
+
